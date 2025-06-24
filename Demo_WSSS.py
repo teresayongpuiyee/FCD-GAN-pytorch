@@ -22,14 +22,93 @@ from metrics import Evaluator
 from CommonFunc import *
 from Loss import *
 
+from torchmetrics import Accuracy, Precision, Recall, F1Score, StatScores
+import pandas as pd
+from pathlib import Path
+
 from torch.utils.tensorboard import SummaryWriter
+
+def evaluate(netS, netD, test_dataloader, acc, accuracy_metric, precision_metric, recall_metric, f1_metric, stats_metric, total_dataset_size, prob_thresh, device):
+    # as we found, the train mode can get a better performance
+    netS.eval()
+    netD.eval()
+
+    acc.reset()
+
+    print("Segmentation of Change")
+    with torch.no_grad():
+
+        process_num = 0
+
+        acc.reset()
+
+        for data_array in test_dataloader:
+
+            x = data_array[0]
+            y = data_array[1]
+            ref = data_array[2]
+            item = data_array[3]
+            label = data_array[4]
+
+            x = x.to(device)
+            y = y.to(device)
+            label = label.to(device)
+            label = label[:, -1]
+
+            cmap = netS(x, y)
+
+            cout = netD(x, y)
+
+            preds = (cout >= 0.5).float()
+
+            # Update each metric with the current batch predictions and labels
+            accuracy_metric.update(preds, label)
+            precision_metric.update(preds, label)
+            recall_metric.update(preds, label)
+            f1_metric.update(preds, label)
+            stats_metric.update(preds, label)  # Update stats metric
+
+            cmask = torch.zeros_like(cmap)
+            cmask[cmap > prob_thresh] = 1
+
+            for ns in range(x.size(0)):
+                change_mask = cmask[ns][0]
+                change_mask = change_mask.cpu().numpy()
+                ref_mask = ref[ns][0].numpy()
+
+                acc.add_batch(ref_mask.astype(np.int16), change_mask.astype(np.int16))
+
+            process_num += x.size()[0]
+            print('\rProcessing batch: {}/{}'.format(process_num, total_dataset_size), end='', flush=True)
+
+    # Compute final metrics after the loop
+    accuracy = accuracy_metric.compute()
+    precision = precision_metric.compute()
+    recall = recall_metric.compute()
+    f1 = f1_metric.compute()
+    # Get TP, TN, FP, FN from the stats metric
+    tp, fp, tn, fn, _ = stats_metric.compute()
+
+    cls_score = {"accuracy": float(accuracy.item()), "precision": float(precision.item()), "recall": float(recall.item()), "f1": float(f1.item()), "tp": int(tp.item()), "fp": int(fp.item()), "tn": int(tn.item()), "fn": int(fn.item())}
+    ciou = acc.Mean_Intersection_over_Union()[1]
+
+    # Print or log metrics
+    print("cls_score:")
+    print(cls_score)
+
+    print(
+        '\rSegmentation, Overall Accuracy: {:.4f}, Kappa: {:.4f}, Precision Rate: {:.4f}, Recall Rate: {:.4f}, F1:{:.4f}, mIOU:{:.4f}, cIOU:{:.4f}'.format(
+            acc.Pixel_Accuracy(), acc.Pixel_Kappa(), acc.Pixel_Precision_Rate(),
+            acc.Pixel_Recall_Rate(), acc.Pixel_F1_score(), acc.Mean_Intersection_over_Union()[0], ciou))
+
+    return float(f1.item()), ciou
 
 if __name__ == '__main__':
 
-    device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     init_num_epochs_G = 50  # initial epochs for generator training
-    num_epochs = 50 # epochs for adversarial training
+    num_epochs = 100 # epochs for adversarial training
     learning_rate = 0.0005 # learning rate
     # learning_rate = 3e-4
     unc_batch_size = 50 # batch size for testing
@@ -56,14 +135,18 @@ if __name__ == '__main__':
     modelG_reuse = True # reuse of trained generator
 
     discriminator_continuous = True # soft or hard change map for optimization
-
-    ImgDirX = r'/data/chen.wu/data/ChangeNet/Building/Building CD Slice Dataset/before'
-    ImgDirY = r'/data/chen.wu/data/ChangeNet/Building/Building CD Slice Dataset/after'
-    RefDir = r'/data/chen.wu/data/ChangeNet/Building/Building CD Slice Dataset/Label'
-    LabelDir = r'/data/chen.wu/data/ChangeNet/Building/Building CD Slice Dataset'
-    OutGModelDir = r'/data/chen.wu/data/ChangeNet/Building/Building CD Slice Dataset/GModel'
+    ds = "bottle"
+    tag = "ge50_ae100"
+    ImgDirX = f"/home/jovyan/change_detection/data/{ds}256/train/A"
+    ImgDirY = f"/home/jovyan/change_detection/data/{ds}256/train/B"
+    RefDir = f"/home/jovyan/change_detection/data/{ds}256/train/label"
+    LabelDir = f"/home/jovyan/change_detection/data/{ds}256/train/list"
+    OutGModelDir = f"/home/jovyan/change_detection/FCD-GAN-pytorch/outputs/{ds}_{tag}/GModel"
     extName = '_l1w05_nl1w15_norm_github'
-    OutDir = r'/data/chen.wu/data/ChangeNet/Building/Building CD Slice Dataset/Detection_WSS{}'.format(extName)
+    OutDir = f"/home/jovyan/change_detection/FCD-GAN-pytorch/outputs/{ds}_{tag}/Detection_WSS{extName}"
+
+    if os.path.exists(OutGModelDir) == False:
+        os.makedirs(OutGModelDir)
 
     writer = SummaryWriter(comment='Building_WSSS{}'.format(extName))
 
@@ -71,8 +154,8 @@ if __name__ == '__main__':
     statsName = 'stats'
     dataset = WHU_Dataset(ImgDirX, ImgDirY, RefDir, LabelDir, label_selected='-1')
     # scale_list1, scale_list2 = Dataset_maxmin(statsPath1, statsPath2, dataset)
-    statsPath1 = os.path.join(ImgDirX, '{}_meanstd.txt'.format(statsName))
-    statsPath2 = os.path.join(ImgDirY, '{}_meanstd.txt'.format(statsName))
+    statsPath1 = os.path.join(f"/home/jovyan/change_detection/FCD-GAN-pytorch/outputs/{ds}_{tag}", 'X_{}_meanstd.txt'.format(statsName))
+    statsPath2 = os.path.join(f"/home/jovyan/change_detection/FCD-GAN-pytorch/outputs/{ds}_{tag}", 'Y_{}_meanstd.txt'.format(statsName))
     meanX, stdX, meanY, stdY = Dataset_meanstd(statsPath1, statsPath2, dataset)
     # scaler = SCALE(scale_list1, scale_list2)
     scaler = NORMALIZE(meanX, stdX, meanY, stdY)
@@ -136,6 +219,21 @@ if __name__ == '__main__':
 
     if g_weight == 0:
         init_num_epochs_G = 0
+
+    val_ImgDirX = f"/home/jovyan/change_detection/data/{ds}256/val/A"
+    val_ImgDirY = f"/home/jovyan/change_detection/data/{ds}256/val/B"
+    val_RefDir = f"/home/jovyan/change_detection/data/{ds}256/val/label"
+    val_LabelDir = f"/home/jovyan/change_detection/data/{ds}256/val/list"
+
+    val_dataset = WHU_Dataset(val_ImgDirX, val_ImgDirY, val_RefDir, val_LabelDir, scale=scaler, label_selected='-1')
+    test_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Initialize metric objects
+    accuracy_metric = Accuracy(task="binary").to('cuda')
+    precision_metric = Precision(task="binary", zero_division=1).to('cuda')
+    recall_metric = Recall(task="binary", zero_division=1).to('cuda')
+    f1_metric = F1Score(task="binary", zero_division=1).to('cuda')
+    stats_metric = StatScores(task="binary").to('cuda')  # To get TP, TN, FP, FN
 
     print('Start Generator Training')
     with torch.enable_grad():
@@ -205,6 +303,9 @@ if __name__ == '__main__':
 
     netG.eval()
 
+    best_F1 = 0.0
+    best_iou = 0.0
+
     print('Start Adversarial Training')
     with torch.enable_grad():
 
@@ -221,6 +322,16 @@ if __name__ == '__main__':
             ssim_loss_aver = 0
 
             acc.reset()
+
+            netS.train()
+            netD.train()
+
+            # Reset metrics after each validation phase
+            accuracy_metric.reset()
+            precision_metric.reset()
+            recall_metric.reset()
+            f1_metric.reset()
+            stats_metric.reset()
 
             # warm-up strategy
             adjust_learning_rate(optimizerS, i, lr_start=1e-4, lr_max=1e-3, lr_warm_up_epoch=5)
@@ -384,72 +495,42 @@ if __name__ == '__main__':
             writer.add_scalar('mIOU', acc.Mean_Intersection_over_Union()[0], i + init_num_epochs_G)
             writer.add_scalar('cIOU', acc.Mean_Intersection_over_Union()[1], i + init_num_epochs_G)
 
-    # generate the final result
+            if (i + 1) % 10 == 0:
+                f1, ciou = evaluate(netS, netD, test_dataloader, acc, accuracy_metric, precision_metric, recall_metric, f1_metric, stats_metric, total_dataset_size, prob_thresh, device)
 
-    # as we found, the train mode can get a better performance
-    # netS.eval()
-    # netD.eval()
+                if f1 > best_F1:
+                    best_F1 = f1
+                    best_F1_epoch = i + 1
 
-    c_dataset = WHU_Dataset(ImgDirX, ImgDirY, RefDir, LabelDir, scale=scaler, label_selected='1')
-    test_dataloader = DataLoader(c_dataset, batch_size=batch_size, shuffle=False)
+                    print(f"Best F1 epoch: {best_F1_epoch}")
+                    
+                    pth_files = Path(OutDir).glob('*.pkl')
+                    for pth_file in pth_files:
+                        if "f1_iter_" in str(pth_file):
+                            pth_file.unlink()
+                    
+                    path = os.path.join(OutDir, f'f1_iter_{best_F1_epoch}_SModel.pkl')
+                    torch.save(netS.state_dict(), path)
 
-    print("Saving Change Map and Model")
+                    path = os.path.join(OutDir, f'f1_iter_{best_F1_epoch}_DModel.pkl')
+                    torch.save(netD.state_dict(), path)
 
-    print("Segmentation of Change")
-    with torch.no_grad():
+                if ciou > best_iou:
+                    best_iou = ciou
+                    best_iou_epoch = i + 1
 
-        process_num = 0
+                    print(f"Best ciou epoch: {best_iou_epoch}")
+                    
+                    pth_files = Path(OutDir).glob('*.pkl')
+                    for pth_file in pth_files:
+                        if "iou_iter_" in str(pth_file):
+                            pth_file.unlink()
+                    
+                    path = os.path.join(OutDir, f'iou_iter_{best_iou_epoch}_SModel.pkl')
+                    torch.save(netS.state_dict(), path)
 
-        acc.reset()
-
-        for data_array in test_dataloader:
-
-            x = data_array[0]
-            y = data_array[1]
-            ref = data_array[2]
-            item = data_array[3]
-            label = data_array[4]
-
-            x = x.to(device)
-            y = y.to(device)
-
-            cmap = netS(x, y)
-
-            cmask = torch.zeros_like(cmap)
-            cmask[cmap > prob_thresh] = 1
-
-            for ns in range(x.size(0)):
-                change_mask = cmask[ns][0]
-                change_mask = change_mask.cpu().numpy()
-                ref_mask = ref[ns][0].numpy()
-                outPath = os.path.join(OutDir, c_dataset.getFileName(item[ns].item()))
-                change_write = write_changemap(change_mask, ref_mask, write_color=write_color)
-
-                acc.add_batch(ref_mask.astype(np.int16), change_mask.astype(np.int16))
-
-                if write_grey == True:
-                    change_mask = cmap[ns][0]
-                    change_mask = change_mask.cpu().numpy()
-                    change_write_density = np.zeros((change_mask.shape[0], change_mask.shape[1]))
-                    change_write_density = change_mask * 255
-                    change_write_density = Image.fromarray(np.uint8(change_write_density))
-                    OutDensityPath = os.path.join(OutDensityDir, c_dataset.getFileName(item[ns].item()))
-                    change_write_density.save(OutDensityPath)
-
-                if len(change_write.shape) == 3:
-                    change_write = change_write.transpose((1, 2, 0))
-                change_write = Image.fromarray(np.uint8(change_write))
-                change_write.save(outPath)
-
-            process_num += x.size()[0]
-            print('\rProcessing batch: {}/{}'.format(process_num, total_dataset_size), end='', flush=True)
-
-    print(
-        '\rSegmentation, Overall Accuracy: {:.4f}, Kappa: {:.4f}, Precision Rate: {:.4f}, Recall Rate: {:.4f}, F1:{:.4f}, mIOU:{:.4f}, cIOU:{:.4f}'.format(
-            acc.Pixel_Accuracy(), acc.Pixel_Kappa(), acc.Pixel_Precision_Rate(),
-            acc.Pixel_Recall_Rate(), acc.Pixel_F1_score(), acc.Mean_Intersection_over_Union()[0], acc.Mean_Intersection_over_Union()[1]))
-
-    print('\r' + 'End of Saving', flush=True)
+                    path = os.path.join(OutDir, f'iou_iter_{best_iou_epoch}_DModel.pkl')
+                    torch.save(netD.state_dict(), path)
 
     path = os.path.join(OutDir, 'SModel.pkl')
     torch.save(netS.state_dict(), path)
